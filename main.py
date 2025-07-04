@@ -171,6 +171,14 @@ def main():
                 if (object_id not in last_speed_update) or (frame_idx - last_speed_update[object_id] >= SPEED_UPDATE_INTERVAL):
                     # Use moving average of last 10 speeds
                     avg_speed = sum(speed_history[object_id]) / len(speed_history[object_id])
+                    prev_speed = displayed_speed.get(object_id, avg_speed)
+                    # Clamp the speed update to a maximum change of 15 km/h per update
+                    MAX_SPEED_CHANGE = 15.0
+                    if abs(avg_speed - prev_speed) > MAX_SPEED_CHANGE:
+                        if avg_speed > prev_speed:
+                            avg_speed = prev_speed + MAX_SPEED_CHANGE
+                        else:
+                            avg_speed = prev_speed - MAX_SPEED_CHANGE
                     displayed_speed[object_id] = avg_speed
                     last_speed_update[object_id] = frame_idx
                 
