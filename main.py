@@ -3,6 +3,48 @@ import numpy as np
 from ultralytics import YOLO
 from collections import defaultdict, deque
 import math
+import pandas as pd  # <-- Add this import
+
+# --- FOUR REFERENCE POINTS FOR HOMOGRAPHY CALIBRATION ---
+# Example pixel coordinates (x, y) in the image (choose corners or known landmarks)
+image_points = np.array([
+    [100, 100],    # Top-left
+    [1820, 100],   # Top-right
+    [1820, 980],   # Bottom-right
+    [100, 980]     # Bottom-left
+], dtype=np.float32)
+
+# Example GPS coordinates (lat, lon) for each point (replace with real values for your use case)
+gps_points = [
+    (12.971598, 77.594566),   # Top-left
+    (12.971598, 77.595566),   # Top-right
+    (12.970598, 77.595566),   # Bottom-right
+    (12.970598, 77.594566)    # Bottom-left
+]
+
+# Convert GPS to local meters using a simple equirectangular projection
+# Use the top-left as the reference origin
+REF_LAT, REF_LON = gps_points[0]
+def gps_to_local_xy(lat, lon, lat0, lon0):
+    """Convert GPS (lat, lon) to local (x, y) in meters relative to (lat0, lon0)"""
+    delta_lat = (lat - lat0) * 111320
+    delta_lon = (lon - lon0) * 111320 * math.cos(math.radians(lat0))
+    return delta_lon, delta_lat
+
+# Compute world points in meters for each GPS point
+world_points = np.array([
+    gps_to_local_xy(lat, lon, REF_LAT, REF_LON) for (lat, lon) in gps_points
+], dtype=np.float32)
+
+# Compute homography from image points to world points
+H, _ = cv2.findHomography(image_points, world_points)
+
+def pixel_to_world(pt, H):
+    """Convert a 2D pixel point to real-world coordinates using homography"""
+    px = np.array([pt[0], pt[1], 1.0])
+    world_pt = H @ px
+    world_pt /= world_pt[2]
+    return world_pt[0], world_pt[1]
 
 # --- CONFIGURATION ---
 VIDEO_PATH = r"E:\RGB-cameras\3727445-hd_1920_1080_30fps.mp4"  # Path to input video
@@ -10,6 +52,7 @@ MODEL_NAME = 'yolov8n.pt'  # You can use yolov8n.pt, yolov8s.pt, etc.
 METERS_PER_PIXEL = 0.05  # Calibration factor (meters per pixel)
 FPS = 30  # Frames per second of the video
 VEHICLE_CLASSES = [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
+SKIP_FRAMES = 2  # Process every 2nd frame for speed
 
 # --- TRACKER ---
 class CentroidTracker:
@@ -101,10 +144,34 @@ def calculate_speed(trajectory, meters_per_pixel, fps, window=5):
     speed_kmh = speed_mps * 3.6
     return speed_kmh
 
+    # --- GPS REFERENCE POINT ---
+    # Set this to the GPS coordinates corresponding to the (0,0) of your world plane
+REF_LAT = 12.971598  # Example: Bangalore
+REF_LON = 77.594566
+
+def xy_to_latlon(x, y, lat0, lon0):
+    """Convert local (x, y) meters to latitude and longitude."""
+    delta_lat = y / 111320
+    delta_lon = x / (111320 * math.cos(math.radians(lat0)))
+    lat = lat0 + delta_lat
+    lon = lon0 + delta_lon
+    return lat, lon
+
+
 # --- MAIN SCRIPT ---
 def main():
     # Load YOLOv8 model
     model = YOLO(MODEL_NAME)
+    # Enable GPU if available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            model.to('cuda')
+            print("Using GPU acceleration.")
+        else:
+            print("GPU not available, using CPU.")
+    except ImportError:
+        print("Torch not installed, using CPU.")
 
     # Open video
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -123,11 +190,17 @@ def main():
     last_speed_update = {}  # object_id -> last frame index when speed was updated
     SPEED_UPDATE_INTERVAL = 5  # update speed label every 5 frames
 
+    object_data = defaultdict(lambda: {'lat': [], 'lon': [], 'speed': []})  # <-- Add this line
+
     while True:
         if not paused:
             ret, frame = cap.read()
             if not ret:
                 break
+            # Frame skipping for optimization
+            if frame_idx % SKIP_FRAMES != 0:
+                frame_idx += 1
+                continue
         else:
             # If paused, do not read a new frame
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -162,11 +235,20 @@ def main():
             if best_box is not None:
                 x1, y1, x2, y2 = best_box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
+
+                # Convert centroid to real-world coordinates
+                world_x, world_y = pixel_to_world(centroid, H)
+                lat, lon = xy_to_latlon(world_x, world_y, REF_LAT, REF_LON)
+
                 # Calculate speed
                 speed = calculate_speed(trajectories[object_id], METERS_PER_PIXEL, FPS)
                 speed_history[object_id].append(speed)
-                
+
+                # Collect data for Excel output
+                object_data[object_id]['lat'].append(lat)
+                object_data[object_id]['lon'].append(lon)
+                object_data[object_id]['speed'].append(speed)
+
                 # Only update displayed speed every SPEED_UPDATE_INTERVAL frames
                 if (object_id not in last_speed_update) or (frame_idx - last_speed_update[object_id] >= SPEED_UPDATE_INTERVAL):
                     # Use moving average of last 10 speeds
@@ -181,9 +263,10 @@ def main():
                             avg_speed = prev_speed - MAX_SPEED_CHANGE
                     displayed_speed[object_id] = avg_speed
                     last_speed_update[object_id] = frame_idx
-                
-                label = f"ID {object_id} {displayed_speed.get(object_id, 0):.1f} km/h"
-                
+
+                # Remove object ID from label, only show speed and lat/lon
+                label = f"{displayed_speed.get(object_id, 0):.1f} km/h\n({lat}, {lon})"
+
                 # Draw a filled rectangle as background for the label
                 (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
                 label_x = x1
@@ -192,11 +275,11 @@ def main():
                 rect_bottom_right = (label_x + text_width, label_y + baseline)
                 cv2.rectangle(frame, rect_top_left, rect_bottom_right, (0, 0, 0), thickness=-1)
                 cv2.putText(frame, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                
+
                 # Draw centroid
                 cv2.circle(frame, tuple(centroid.astype(int)), 4, (255, 0, 0), -1)
 
-        # Resize frame for smaller GUI window
+        # Resize frame for smaller GUI window and update GUI every frame
         display_frame = cv2.resize(frame, None, fx=0.7, fy=0.7)
         cv2.imshow('Vehicle Detection & Speed', display_frame)
         key = cv2.waitKey(0 if paused else 1) & 0xFF
@@ -214,6 +297,19 @@ def main():
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         if not paused:
             frame_idx += 1
+
+    # After the while loop, before cap.release()
+    rows = []
+    for object_id, data in object_data.items():
+        if data['lat'] and data['lon'] and data['speed']:
+            avg_lat = sum(data['lat']) / len(data['lat'])
+            avg_lon = sum(data['lon']) / len(data['lon'])
+            avg_speed = sum(data['speed']) / len(data['speed'])
+            rows.append({'id': object_id, 'lat': avg_lat, 'lon': avg_lon, 'speed': avg_speed})
+
+    df = pd.DataFrame(rows, columns=['id', 'lat', 'lon', 'speed'])
+    df.to_excel('object_speeds.xlsx', index=False)
+    print('Excel file saved as object_speeds.xlsx')
 
     cap.release()
     cv2.destroyAllWindows()
